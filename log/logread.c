@@ -56,10 +56,25 @@ static const struct blobmsg_policy log_policy[] = {
 	[LOG_TIME] = { .name = "time", .type = BLOBMSG_TYPE_INT64 },
 };
 
+enum {
+	TPL_FIELD_MESSAGE,
+	TPL_FIELD_PRIORITY,
+	TPL_FIELD_SOURCE,
+	TPL_FIELD_TIMESTAMP,
+};
+
+static const char *TPL_FIELDS[] = {
+	[TPL_FIELD_MESSAGE] = "%message%",
+	[TPL_FIELD_PRIORITY] = "%priority%",
+	[TPL_FIELD_SOURCE] = "%source%",
+	[TPL_FIELD_TIMESTAMP] = "%timestamp%",
+};
+
 static struct uloop_timeout retry;
 static struct uloop_fd sender;
 static regex_t regexp_preg;
 static const char *log_file, *log_ip, *log_port, *log_prefix, *pid_file, *hostname, *regexp_pattern;
+static const char *log_template;
 static int log_type = LOG_STDOUT;
 static int log_size, log_udp, log_follow, log_trailer_null = 0;
 static int log_timestamp;
@@ -102,6 +117,7 @@ static int log_notify(struct blob_attr *msg)
 	struct stat s;
 	char buf[512];
 	char buf_ts[32];
+	char buf_p[11];
 	uint32_t p;
 	char *str;
 	time_t t;
@@ -137,34 +153,118 @@ static int log_notify(struct blob_attr *msg)
 	    regexec(&regexp_preg, m, 0, NULL, 0) == REG_NOMATCH)
 		return 0;
 	t = blobmsg_get_u64(tb[LOG_TIME]) / 1000;
-	if (log_timestamp) {
-		t_ms = blobmsg_get_u64(tb[LOG_TIME]) % 1000;
-		snprintf(buf_ts, sizeof(buf_ts), "[%lu.%03u] ",
-				(unsigned long)t, t_ms);
-	}
+	t_ms = blobmsg_get_u64(tb[LOG_TIME]) % 1000;
+	snprintf(buf_ts, sizeof(buf_ts), "[%lu.%03u] ", (unsigned long) t, t_ms);
 	c = ctime(&t);
 	p = blobmsg_get_u32(tb[LOG_PRIO]);
 	c[strlen(c) - 1] = '\0';
 	str = blobmsg_format_json(msg, true);
+	snprintf(buf_p, sizeof buf_p, "%u", p);
+
+	if (log_template) {
+		size_t len;
+		int tpli = -1;
+
+		if ((len = strlen(log_template) + 1) > sizeof buf) {
+			fprintf(stderr, "size of template is larger than the internal buffer\n");
+			return 1;
+		}
+		strncpy(buf, log_template, len);
+
+		char *substr = buf;
+		for (;;) {
+			char *substrnext = NULL;
+			for (unsigned short i = 0; i < sizeof TPL_FIELDS / sizeof (char *); ++i) {
+				char *substrbuf = strstr(substr, TPL_FIELDS[i]);
+				if (!substrbuf || (substrnext && substrbuf > substrnext))
+					continue;
+				substrnext = substrbuf;
+				tpli = i;
+			}
+			if (!substrnext)
+				break;
+
+			substr = substrnext;
+			char *field = NULL;
+			switch (tpli) {
+			case TPL_FIELD_MESSAGE:
+				field = m;
+				break;
+			case TPL_FIELD_PRIORITY:
+				field = buf_p;
+				break;
+			case TPL_FIELD_SOURCE:
+				switch (blobmsg_get_u32(tb[LOG_SOURCE])) {
+				case SOURCE_KLOG:
+					field = "kernel";
+					break;
+				case SOURCE_SYSLOG:
+					field = "syslog";
+					break;
+				case SOURCE_INTERNAL:
+					field = "internal";
+					break;
+				default:
+					field = "-";
+					break;
+				}
+				break;
+			case TPL_FIELD_TIMESTAMP:
+				field = buf_ts;
+				break;
+			}
+			if (!field || tpli < 0)
+				continue;
+
+			char buf2[sizeof buf] = {'\0'};
+			short availen = sizeof buf2 - 1;
+
+			availen -= substr - buf;
+			strncat(buf2, buf, substr - buf);
+
+			size_t fieldlen = strlen(field);
+			availen -= fieldlen;
+			if (availen < 0) {
+				fprintf(stderr, "size of log is larger than the internal buffer\n");
+				return 1;
+			}
+			strncat(buf2, field, fieldlen);
+
+			size_t fieldkwlen = strlen(TPL_FIELDS[tpli]);
+			len = strlen(substr) - fieldkwlen;
+			availen -= len;
+			if (availen < 0) {
+				fprintf(stderr, "size of log is larger than the internal buffer\n");
+				return 1;
+			}
+			strncat(buf2, substr + fieldkwlen, len);
+
+			strncpy(buf, buf2, sizeof buf2 - availen);
+			substr += fieldlen;
+		}
+	}
+
 	if (log_type == LOG_NET) {
 		int err;
 
-		snprintf(buf, sizeof(buf), "<%u>", p);
-		strncat(buf, c + 4, 16);
-		if (log_timestamp) {
-			strncat(buf, buf_ts, sizeof(buf) - strlen(buf) - 1);
+		if (!log_template) {
+			snprintf(buf, sizeof(buf), "<%u>", p);
+			strncat(buf, c + 4, sizeof buf_p);
+			if (log_timestamp) {
+				strncat(buf, buf_ts, sizeof(buf) - strlen(buf) - 1);
+			}
+			if (hostname) {
+				strncat(buf, hostname, sizeof(buf) - strlen(buf) - 1);
+				strncat(buf, " ", sizeof(buf) - strlen(buf) - 1);
+			}
+			if (log_prefix) {
+				strncat(buf, log_prefix, sizeof(buf) - strlen(buf) - 1);
+				strncat(buf, ": ", sizeof(buf) - strlen(buf) - 1);
+			}
+			if (blobmsg_get_u32(tb[LOG_SOURCE]) == SOURCE_KLOG)
+				strncat(buf, "kernel: ", sizeof(buf) - strlen(buf) - 1);
+			strncat(buf, m, sizeof(buf) - strlen(buf) - 1);
 		}
-		if (hostname) {
-			strncat(buf, hostname, sizeof(buf) - strlen(buf) - 1);
-			strncat(buf, " ", sizeof(buf) - strlen(buf) - 1);
-		}
-		if (log_prefix) {
-			strncat(buf, log_prefix, sizeof(buf) - strlen(buf) - 1);
-			strncat(buf, ": ", sizeof(buf) - strlen(buf) - 1);
-		}
-		if (blobmsg_get_u32(tb[LOG_SOURCE]) == SOURCE_KLOG)
-			strncat(buf, "kernel: ", sizeof(buf) - strlen(buf) - 1);
-		strncat(buf, m, sizeof(buf) - strlen(buf) - 1);
 		if (log_udp)
 			err = write(sender.fd, buf, strlen(buf));
 		else {
@@ -183,11 +283,18 @@ static int log_notify(struct blob_attr *msg)
 			uloop_timeout_set(&retry, 1000);
 		}
 	} else {
-		snprintf(buf, sizeof(buf), "%s %s%s.%s%s %s\n",
-			c, log_timestamp ? buf_ts : "",
-			getcodetext(LOG_FAC(p) << 3, facilitynames),
-			getcodetext(LOG_PRI(p), prioritynames),
-			(blobmsg_get_u32(tb[LOG_SOURCE])) ? ("") : (" kernel:"), m);
+		if (!log_template) {
+			snprintf(buf, sizeof(buf), "%s %s%s.%s%s %s\n",
+				c, log_timestamp ? buf_ts : "",
+				getcodetext(LOG_FAC(p) << 3, facilitynames),
+				getcodetext(LOG_PRI(p), prioritynames),
+				(blobmsg_get_u32(tb[LOG_SOURCE])) ? ("") : (" kernel:"), m);
+		} else {
+			size_t buflen = strlen(buf);
+			buflen = (buflen < sizeof buf - 1) ? buflen : (sizeof buf - 2);
+			buf[buflen++] = '\n';
+			buf[buflen] = '\0';
+		}
 		ret = write(sender.fd, buf, strlen(buf));
 	}
 
@@ -211,6 +318,7 @@ static int usage(const char *prog)
 		"    -p	<file>		PID file\n"
 		"    -h	<hostname>	Add hostname to the message\n"
 		"    -P	<prefix>	Prefix custom text to streamed messages\n"
+		"    -T	<template>	Custom log output template\n"
 		"    -f			Follow log messages\n"
 		"    -u			Use UDP as the protocol\n"
 		"    -t			Add an extra timestamp\n"
@@ -260,7 +368,7 @@ int main(int argc, char **argv)
 
 	signal(SIGPIPE, SIG_IGN);
 
-	while ((ch = getopt(argc, argv, "u0fcs:l:r:F:p:S:P:h:e:t")) != -1) {
+	while ((ch = getopt(argc, argv, "u0fcs:l:r:F:p:S:P:h:e:tT:")) != -1) {
 		switch (ch) {
 		case 'u':
 			log_udp = 1;
@@ -306,6 +414,9 @@ int main(int argc, char **argv)
 			break;
 		case 't':
 			log_timestamp = 1;
+			break;
+		case 'T':
+			log_template = optarg;
 			break;
 		default:
 			return usage(*argv);
