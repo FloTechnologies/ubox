@@ -31,6 +31,7 @@
 #include <libubox/usock.h>
 #include <libubox/uloop.h>
 #include "libubus.h"
+#include "../rfc3339/timestamp.h"
 #include "syslog.h"
 
 enum {
@@ -61,6 +62,7 @@ enum {
 	TPL_FIELD_PRIORITY,
 	TPL_FIELD_SOURCE,
 	TPL_FIELD_TIMESTAMP,
+	TPL_FIELD_RFC3339,
 };
 
 static const char *TPL_FIELDS[] = {
@@ -68,6 +70,7 @@ static const char *TPL_FIELDS[] = {
 	[TPL_FIELD_PRIORITY] = "%priority%",
 	[TPL_FIELD_SOURCE] = "%source%",
 	[TPL_FIELD_TIMESTAMP] = "%timestamp%",
+	[TPL_FIELD_RFC3339] = "%rfc3339%",
 };
 
 static struct uloop_timeout retry;
@@ -116,12 +119,14 @@ static int log_notify(struct blob_attr *msg)
 	struct blob_attr *tb[__LOG_MAX];
 	struct stat s;
 	char buf[512];
+	char buf_rfc3339[sizeof "YYYY-MM-DDThh:mm:ss.xxxZ"];
 	char buf_ts[32];
 	char buf_p[11];
 	uint32_t p;
 	char *str;
 	time_t t;
 	uint32_t t_ms = 0;
+	timestamp_t ts = { 0 };
 	char *c, *m;
 	int ret = 0;
 
@@ -154,6 +159,9 @@ static int log_notify(struct blob_attr *msg)
 		return 0;
 	t = blobmsg_get_u64(tb[LOG_TIME]) / 1000;
 	t_ms = blobmsg_get_u64(tb[LOG_TIME]) % 1000;
+	ts.sec = (int64_t) t;
+	ts.nsec = t_ms * 1000000;
+	timestamp_format_precision(buf_rfc3339, sizeof buf_rfc3339, &ts, 3);
 	snprintf(buf_ts, sizeof(buf_ts), "[%lu.%03u] ", (unsigned long) t, t_ms);
 	c = ctime(&t);
 	p = blobmsg_get_u32(tb[LOG_PRIO]);
@@ -211,6 +219,9 @@ static int log_notify(struct blob_attr *msg)
 				break;
 			case TPL_FIELD_TIMESTAMP:
 				field = buf_ts;
+				break;
+			case TPL_FIELD_RFC3339:
+				field = buf_rfc3339;
 				break;
 			}
 			if (!field || tpli < 0)

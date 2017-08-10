@@ -62,7 +62,10 @@ INSTALL(TARGETS logd
 	RUNTIME DESTINATION sbin
 )
 
-ADD_EXECUTABLE(logread log/logread.c)
+ADD_EXECUTABLE(logread log/logread.c
+	rfc3339/timestamp_format.c
+	rfc3339/timestamp_valid.c
+)
 TARGET_LINK_LIBRARIES(logread ubox ubus ${json} blobmsg_json)
 INSTALL(TARGETS logread
 	RUNTIME DESTINATION sbin
